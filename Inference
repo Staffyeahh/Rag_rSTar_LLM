@@ -1,0 +1,456 @@
+# reddit.com/r/LocalLLaMA/
+import logging
+import os
+import pickle
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+import faiss
+import matplotlib.pyplot as plt
+import networkx as nx
+import numpy as np
+import torch
+from sentence_transformers import SentenceTransformer
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+# Konfigurer logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Node:
+    """
+    Repræsenterer en node i søgetræet.
+    """
+    state: str
+    action: Optional[str] = None
+    parent: Optional['Node'] = None
+    children: List['Node'] = field(default_factory=list)
+    visits: int = 0
+    value: float = 0.0
+
+    def add_child(self, child_node: 'Node'):
+        self.children.append(child_node)
+        child_node.parent = self
+
+    def is_leaf(self) -> bool:
+        return not self.children
+
+    def update_value(self, reward: float):
+        self.visits += 1
+        # Opdater værdien ved hjælp af inkrementel gennemsnit
+        self.value += (reward - self.value) / self.visits
+
+class RStar:
+    """
+    Implementerer R* søgealgoritmen med retrieval-augmented generation og hukommelse.
+    """
+
+    def __init__(
+        self,
+        system: str,
+        model_name: str,
+        embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        max_depth: int = 3,
+        num_rollouts: int = 5,
+        exploration_constant: float = 1.4,
+        max_tree_size: int = 1000,
+        index_filename: str = "faiss_index.idx",
+        memory_filename: str = "memory_data.pkl"
+    ):
+        self.model_name = model_name
+        self.max_depth = max_depth
+        self.num_rollouts = num_rollouts
+        self.exploration_constant = exploration_constant
+        self.actions = ["A1", "A2", "A3", "A4", "A5"]
+        self.system = system
+        self.max_tree_size = max_tree_size
+
+        self.index_filename = index_filename
+        self.memory_filename = memory_filename
+
+        # Angiv enheden som GPU1
+        self.device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"Bruger enhed: {self.device}")
+
+        logger.info(f"Indlæser tokenizer og model: {model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16 if 'cuda' in str(self.device) else torch.float32,
+            trust_remote_code=True
+        ).to(self.device)
+
+        logger.info(f"Indlæser embeddingsmodel: {embedding_model_name}")
+        self.embedding_model = SentenceTransformer(embedding_model_name, device=str(self.device))
+
+        # Indlæs eller initialiser FAISS-indekset
+        if os.path.exists(self.index_filename):
+            self.load_faiss_index(self.index_filename)
+        else:
+            self.index = faiss.IndexFlatL2(self.embedding_model.get_sentence_embedding_dimension())
+            logger.info("Oprettede et nyt FAISS-indeks.")
+
+        # Indlæs hukommelsesdata
+        self.load_memory_data(self.memory_filename)
+
+        logger.info(
+            f"Initialiserede RStar med model: {model_name}, max_depth: {max_depth}, num_rollouts: {num_rollouts}"
+        )
+
+        self.conversation_history: List[Dict[str, str]] = [
+            {"role": "system", "content": system}
+        ]
+
+    def embed_text(self, text: str) -> np.ndarray:
+        """
+        Embeder tekst ved hjælp af embeddingsmodellen.
+        """
+        return self.embedding_model.encode([text], convert_to_numpy=True)[0]
+
+    def generate_possible_paths(self, state: str, question: str) -> Dict[str, str]:
+        """
+        Genererer mulige handlinger og tilhørende prompts baseret på den aktuelle tilstand og spørgsmålet.
+        """
+        paths = {
+            "A1": f"Given the current state: {state}\nGenerate the next logical step in solving {question}.",
+            "A2": f"Given the current state: {state}\nContinue the reasoning process to solve {question}.",
+            "A3": f"Given the current state: {state}\nIdentify a key sub-question to solve {question}.",
+            "A4": f"Given the current state: {state}\nReconsider the previous step to solve {question}.",
+            "A5": f"Given the current state: {state}\nRestate {question} by clearly listing all conditions."
+        }
+        return paths
+
+    def simulate_rollouts(self, node: Node, question: str) -> Dict[str, Tuple[str, float]]:
+        """
+        Simulerer rollouts fra den aktuelle node for alle mulige handlinger.
+        """
+        possible_paths = self.generate_possible_paths(node.state, question)
+        results = {}
+        for action, prompt in possible_paths.items():
+            response = self.generate_response(prompt)
+            score = self.evaluate_result(response, question)
+            results[action] = (response, score)
+        return results
+
+    def evaluate_result(self, result: str, question: str) -> float:
+        """
+        Evaluerer resultatet ved at sammenligne det med spørgsmålet ved hjælp af semantisk similaritet.
+        """
+        question_embedding = self.embed_text(question)
+        result_embedding = self.embed_text(result)
+        similarity = np.dot(question_embedding, result_embedding) / (
+            np.linalg.norm(question_embedding) * np.linalg.norm(result_embedding)
+        )
+        return similarity
+
+    def rollout(self, node: Node, question: str):
+        """
+        Udfører en enkelt rollout fra den givne node.
+        """
+        current_node = node
+        depth = 0
+
+        while depth < self.max_depth:
+            if current_node.is_leaf():
+                # Udvid noden
+                for action in self.actions:
+                    new_state = self.simulate_action(current_node.state, action, question)
+                    child_node = Node(new_state, action)
+                    current_node.add_child(child_node)
+            # Vælg det bedste barn
+            current_node = self.select_child(current_node)
+            depth += 1
+
+        # Evaluer bladnoden
+        reward = self.evaluate_state(current_node.state, question)
+        self.backpropagate(current_node, reward)
+
+    def select_child(self, node: Node) -> Node:
+        """
+        Vælger det bedste barn baseret på UCT (Upper Confidence Bound for Trees).
+        """
+
+        def uct_score(n: Node):
+            if n.visits == 0:
+                return float('inf')
+            return (n.value / n.visits) + self.exploration_constant * np.sqrt(
+                (2 * np.log(node.visits)) / n.visits
+            )
+
+        # Vælg det barn med den højeste UCT-score
+        best_child = max(node.children, key=uct_score)
+        return best_child
+
+    def simulate_action(self, state: str, action: str, question: str) -> str:
+        """
+        Simulerer resultatet af en handling fra den aktuelle tilstand.
+        """
+        # Hent lignende tidligere interaktioner
+        retrieved_info = self.retrieve_from_memory(question)
+        retrieved_text = "\n".join([info['text'] for info in retrieved_info])
+
+        # Konstruer prompten med hentet information
+        prompt = (
+            f"Given the current state: {state}, and retrieved information:\n{retrieved_text}\n"
+            f"Perform the following action: {action} to solve {question}."
+        )
+        return self.generate_response(prompt)
+
+    def evaluate_state(self, state: str, question: str) -> float:
+        """
+        Evaluerer tilstanden ved at sammenligne den med det ønskede svar.
+        """
+        return self.evaluate_result(state, question)
+
+    def backpropagate(self, node: Node, reward: float):
+        """
+        Tilbagespreder belønningen op gennem træet.
+        """
+        while node:
+            node.update_value(reward)
+            node = node.parent
+
+    def update_memory(self, question: str, state: str, result: str):
+        """
+        Opdaterer hukommelsen med nye erfaringer.
+        """
+        text = f"Question: {question}\nState: {state}\nResult: {result}"
+        embedding = self.embed_text(text)
+        self.index.add(np.array([embedding]))
+        self.memory_data.append({'text': text, 'embedding': embedding})
+
+    def retrieve_from_memory(self, query: str) -> List[Dict[str, Any]]:
+        """
+        Henter lignende tidligere erfaringer fra hukommelsen.
+        """
+        if not self.memory_data:
+            return []
+
+        query_embedding = self.embed_text(query)
+        k = min(5, len(self.memory_data))
+        distances, indices = self.index.search(np.array([query_embedding]), k=k)
+        retrieved = [self.memory_data[idx] for idx in indices[0]]
+        return retrieved
+
+    def prune_tree(self, root: Node):
+        """
+        Beskærer træet for at holde det under max_tree_size.
+        """
+        # Fladgør træet til en liste
+        nodes = []
+
+        def collect_nodes(node: Node):
+            nodes.append(node)
+            for child in node.children:
+                collect_nodes(child)
+
+        collect_nodes(root)
+
+        # Hvis træet er for stort, beskær de mindst lovende noder
+        if len(nodes) > self.max_tree_size:
+            nodes.sort(key=lambda n: n.value / n.visits if n.visits > 0 else -float('inf'))
+            nodes_to_remove = nodes[self.max_tree_size:]
+            for node in nodes_to_remove:
+                if node.parent and node in node.parent.children:
+                    node.parent.children.remove(node)
+
+    def parallel_rollouts(self, root: Node, question: str):
+        """
+        Kører rollouts sekventielt for at reducere hukommelsesforbrug.
+        """
+        for _ in range(self.num_rollouts):
+            try:
+                self.rollout(root, question)
+            except Exception as e:
+                logger.error(f"Fejl under rollout: {e}")
+
+    def visualize_tree(self, root: Node, filename: str = "decision_tree.png"):
+        """
+        Visualiserer beslutningstræet og gemmer det til en fil.
+        """
+        G = nx.DiGraph()
+
+        def add_nodes_edges(node: Node, parent: Optional[Node] = None):
+            node_id = id(node)
+            label = f"{node.action}\n{node.state[:20]}...\nValue: {node.value:.2f}\nVisits: {node.visits}"
+            G.add_node(node_id, label=label)
+            if parent:
+                G.add_edge(id(parent), node_id)
+            for child in node.children:
+                add_nodes_edges(child, node)
+
+        add_nodes_edges(root)
+
+        plt.figure(figsize=(20, 10))
+        pos = nx.spring_layout(G, seed=42)
+        nx.draw(G, pos, with_labels=False, node_color='lightblue',
+                node_size=2000, font_size=8, font_weight='bold')
+
+        labels = nx.get_node_attributes(G, 'label')
+        nx.draw_networkx_labels(G, pos, labels, font_size=6)
+
+        plt.savefig(filename)
+        plt.close()
+        logger.info(f"Decision tree visualization saved to {filename}")
+
+    def best_path(self, root: Node, question: str) -> Tuple[str, str]:
+        """
+        Finder den bedste sti fra roden for at besvare spørgsmålet.
+        """
+        self.parallel_rollouts(root, question)
+        self.prune_tree(root)
+        # self.visualize_tree(root)  # Valgfrit: Fjern kommentaren, hvis visualisering er nødvendig
+
+        # Gennemgå træet for at finde den bedste sti
+        current_node = root
+        best_states = []
+
+        while not current_node.is_leaf():
+            current_node = self.select_child(current_node)
+            best_states.append((current_node.action, current_node.state))
+
+        # Returner den sidste handling og tilstand
+        return best_states[-1] if best_states else ("", "")
+
+    def generate_response(self, prompt: str) -> str:
+        """
+        Genererer et svar fra modellen givet en prompt, der inkorporerer hentet information.
+        """
+        # Begræns samtalehistorikken til de sidste N vendinger
+        max_history_turns = 2  # Juster dette tal for at inkludere færre vendinger
+        conversation = self.conversation_history[-(max_history_turns * 2):] + [{"role": "user", "content": prompt}]
+        formatted_conversation = self.format_conversation(conversation)
+
+        # Tokeniser og sørg for, at inputlængden er inden for modellens kontekststørrelse
+        max_input_length = self.model.config.max_position_embeddings - 256  # Reserver plads til generering
+        inputs = self.tokenizer(
+            formatted_conversation,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_input_length,
+            padding=True
+        ).to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs, max_new_tokens=256, num_return_sequences=1, temperature=0.7, do_sample=True
+            )
+
+        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # Opdater samtalehistorikken
+        self.conversation_history.append({"role": "user", "content": prompt})
+        self.conversation_history.append({"role": "assistant", "content": response})
+
+        return response
+
+    def format_conversation(self, conversation: List[Dict[str, str]]) -> str:
+        """
+        Formaterer samtalehistorikken til input til modellen.
+        """
+        formatted = ""
+        for turn in conversation:
+            role = turn["role"]
+            content = turn["content"]
+            formatted += f"{role.capitalize()}:\n{content}\n\n"
+        return formatted
+
+    def chat(self, user_input: str) -> str:
+        """
+        Håndterer en chatrunde med brugeren.
+        """
+        root = Node(state="Initial state")
+        best_action, best_state = self.best_path(root, user_input)
+
+        prompt = (
+            f"Based on the action '{best_action}' and the resulting state '{best_state}', "
+            f"please provide a comprehensive answer to the user's question: {user_input}"
+        )
+
+        response = self.generate_response(prompt)
+
+        # Opdater hukommelsen med den nye erfaring
+        self.update_memory(user_input, best_state, response)
+
+        return response
+
+    def show_memory(self):
+        """
+        Viser modellens hukommelse.
+        """
+        print("\nModellens hukommelse:")
+        for idx, data in enumerate(self.memory_data, start=1):
+            print(f"Erfaring {idx}:")
+            print(f"{data['text']}\n")
+
+    def save_faiss_index(self, index_filename: str):
+        """
+        Gemmer FAISS-indekset til en fil.
+        """
+        faiss.write_index(self.index, index_filename)
+        logger.info(f"FAISS-indeks gemt til {index_filename}")
+
+    def load_faiss_index(self, index_filename: str):
+        """
+        Indlæser FAISS-indekset fra en fil.
+        """
+        if os.path.exists(index_filename):
+            self.index = faiss.read_index(index_filename)
+            logger.info(f"FAISS-indeks indlæst fra {index_filename}")
+        else:
+            logger.warning(f"FAISS-indeksfil {index_filename} ikke fundet. Opretter et nyt indeks.")
+            self.index = faiss.IndexFlatL2(self.embedding_model.get_sentence_embedding_dimension())
+
+    def save_memory_data(self, memory_filename: str):
+        """
+        Gemmer hukommelsesdataene til en fil.
+        """
+        with open(memory_filename, 'wb') as f:
+            pickle.dump(self.memory_data, f)
+        logger.info(f"Hukommelsesdata gemt til {memory_filename}")
+
+    def load_memory_data(self, memory_filename: str):
+        """
+        Indlæser hukommelsesdataene fra en fil og opdaterer FAISS-indekset.
+        """
+        if os.path.exists(memory_filename):
+            with open(memory_filename, 'rb') as f:
+                self.memory_data = pickle.load(f)
+            logger.info(f"Hukommelsesdata indlæst fra {memory_filename}")
+
+            # Tilføj embeddings til FAISS-indekset
+            embeddings = np.array([data['embedding'] for data in self.memory_data])
+            if embeddings.size > 0:
+                self.index.add(embeddings)
+        else:
+            logger.warning(f"Hukommelsesdatafil {memory_filename} ikke fundet. Starter med tom hukommelse.")
+            self.memory_data = []
+
+if __name__ == "__main__":
+    rstar = RStar(
+        system="You are a helpful AI assistant.",
+        model_name="Qwen/Qwen2-0.5B",  # Behold modellen, men sørg for korrekt enhed
+        max_depth=3,
+        num_rollouts=5
+    )
+
+    try:
+        while True:
+            user_input = input("User: ")
+            if user_input.lower() in ['exit', 'quit', 'bye', 'farewell']:
+                break
+
+            response = rstar.chat(user_input)
+            print(f"Assistant: {response}")
+
+            # Valgfrit: Vis hukommelsen efter hver interaktion
+            # rstar.show_memory()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Gem FAISS-indekset og hukommelsesdataene ved afslutning
+        rstar.save_faiss_index(rstar.index_filename)
+        rstar.save_memory_data(rstar.memory_filename)
+        logger.info("Data gemt. Chat session ended.")
